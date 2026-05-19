@@ -31,6 +31,9 @@ options:
   retain_state: true
   json_grouped_topics: false
   discovery_enabled: false
+  discovery_device_name: Sungrow Inverter
+  discovery_device_manufacturer: Sungrow
+  discovery_device_model: ModQTT Bridge
   readings: []
   write_parameters: []
 schema:
@@ -51,6 +54,9 @@ schema:
   retain_state: bool
   json_grouped_topics: bool
   discovery_enabled: bool
+  discovery_device_name: str
+  discovery_device_manufacturer: str
+  discovery_device_model: str
   readings:
     - name: str
       topic_suffix: str

@@ -63,6 +63,9 @@ class MqttConfig(BaseModel):
     retain_state: bool = True
     json_grouped_topics: bool = False
     discovery_enabled: bool = False
+    discovery_device_name: str = "Sungrow Inverter"
+    discovery_device_manufacturer: str = "Sungrow"
+    discovery_device_model: str = "ModQTT Bridge"
 
 
 class AppConfig(BaseModel):

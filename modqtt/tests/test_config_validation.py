@@ -151,3 +151,35 @@ write_parameters:
     assert cfg.readings[0].name == "grid_power"
     assert len(cfg.write_parameters) == 1
     assert cfg.write_parameters[0].name == "ems_mode"
+
+
+def test_load_custom_discovery_device_metadata(tmp_path: Path) -> None:
+    config_path = _write(
+        tmp_path / "config.yml",
+        """
+profile: prod
+allow_writes: false
+modbus:
+  host: inverter.local
+mqtt:
+  host: broker.local
+  topic_prefix: prod/modqtt
+  discovery_enabled: true
+  discovery_device_name: Battery Inverter
+  discovery_device_manufacturer: ACME Energy
+  discovery_device_model: Bridge X1
+readings:
+  - name: grid_power
+    topic_suffix: grid_power
+    register_type: input
+    address: 13033
+    length_words: 2
+    data_type: s32
+""".strip(),
+    )
+
+    cfg = load_config(config_path)
+
+    assert cfg.mqtt.discovery_device_name == "Battery Inverter"
+    assert cfg.mqtt.discovery_device_manufacturer == "ACME Energy"
+    assert cfg.mqtt.discovery_device_model == "Bridge X1"

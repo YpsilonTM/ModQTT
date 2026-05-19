@@ -43,9 +43,9 @@ def build_discovery_payload(mqtt: MqttConfig, reading: ReadingDefinition) -> dic
         "availability_topic": mqtt.availability_topic,
         "device": {
             "identifiers": [mqtt.client_id],
-            "name": "Sungrow Inverter",
-            "manufacturer": "Sungrow",
-            "model": "ModQTT Bridge",
+            "name": mqtt.discovery_device_name,
+            "manufacturer": mqtt.discovery_device_manufacturer,
+            "model": mqtt.discovery_device_model,
         },
     }
     if reading.unit:

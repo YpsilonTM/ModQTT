@@ -1,6 +1,11 @@
+from __future__ import annotations
+
 # Test Home Assistant discovery payload generation
+import math
+
 import pytest
 from src.models import MqttConfig, ReadingDefinition
+from src.decoder import apply_transform, decode_raw_value
 from src.publisher import build_discovery_payload
 
 def test_build_discovery_payload_basic():
@@ -40,13 +45,36 @@ def test_build_discovery_payload_basic():
     assert payload["device_class"] == "voltage"
     assert payload["state_class"] == "measurement"
     assert payload["device"]["identifiers"] == ["test-bridge"]
-from __future__ import annotations
 
-import math
 
-import pytest
+def test_build_discovery_payload_uses_configured_device_metadata():
+    mqtt = MqttConfig(
+        host="localhost",
+        client_id="test-bridge",
+        topic_prefix="dev/modqtt",
+        availability_topic="bridge/availability",
+        discovery_enabled=True,
+        discovery_device_name="Battery Inverter",
+        discovery_device_manufacturer="ACME Energy",
+        discovery_device_model="Bridge X1",
+    )
+    reading = ReadingDefinition(
+        name="test_sensor",
+        topic_suffix="test_sensor",
+        register_type="input",
+        address=1,
+        length_words=1,
+        data_type="u16",
+    )
 
-from src.decoder import apply_transform, decode_raw_value
+    payload = build_discovery_payload(mqtt, reading)
+
+    assert payload["device"] == {
+        "identifiers": ["test-bridge"],
+        "name": "Battery Inverter",
+        "manufacturer": "ACME Energy",
+        "model": "Bridge X1",
+    }
 
 
 @pytest.mark.parametrize(
