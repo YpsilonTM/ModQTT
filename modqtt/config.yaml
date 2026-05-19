@@ -1,6 +1,6 @@
 name: ModQTT
 slug: modqtt
-description: Modbus TCP to MQTT bridge for Sungrow inverters
+description: General-purpose Modbus TCP to MQTT bridge
 version: 0.1.0
 url: https://github.com/YpsilonTM/ModQTT
 arch:
@@ -16,9 +16,7 @@ map:
   - config:rw
 options:
   profile: prod
-  read_only_mode: true
   allow_writes: false
-  registers_file: ""
   modbus_host: 192.168.50.11
   modbus_port: 502
   modbus_unit_id: 1
@@ -38,9 +36,7 @@ options:
   write_parameters: []
 schema:
   profile: list(dev|prod)
-  read_only_mode: bool
   allow_writes: bool
-  registers_file: str?
   modbus_host: str
   modbus_port: int(1,65535)
   modbus_unit_id: int(0,255)
