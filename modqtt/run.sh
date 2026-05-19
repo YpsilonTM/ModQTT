@@ -16,9 +16,7 @@ with options_path.open('r', encoding='utf-8') as handle:
 
 config = {
     'profile': options.get('profile', 'prod'),
-    'read_only_mode': options.get('read_only_mode', True),
     'allow_writes': options.get('allow_writes', False),
-    'registers_file': options.get('registers_file') or None,
     'modbus': {
         'host': options.get('modbus_host', '127.0.0.1'),
         'port': options.get('modbus_port', 502),

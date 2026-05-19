@@ -67,9 +67,7 @@ class MqttConfig(BaseModel):
 
 class AppConfig(BaseModel):
     profile: Profile = "prod"
-    read_only_mode: bool = True
     allow_writes: bool = False
-    registers_file: str | None = None
     modbus: ModbusConfig
     mqtt: MqttConfig
     readings: list[ReadingDefinition]
@@ -79,9 +77,6 @@ class AppConfig(BaseModel):
     def _validate_safety(self) -> AppConfig:
         if self.profile == "dev" and self.mqtt.topic_prefix.startswith("prod/"):
             msg = "dev profile must not publish under prod/ prefix"
-            raise ValueError(msg)
-        if self.read_only_mode and self.allow_writes:
-            msg = "read_only_mode=true requires allow_writes=false"
             raise ValueError(msg)
         return self
 

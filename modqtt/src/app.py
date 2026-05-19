@@ -17,7 +17,7 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--config",
         type=Path,
-        default=Path("modqtt.yaml"),
+        default=Path("config_local/modqtt.yaml"),
         help="Path to YAML config",
     )
     parser.add_argument("--once", action="store_true", help="Run one poll cycle and exit")
@@ -43,10 +43,8 @@ def main() -> int:
     if args.write_name is not None or args.write_value is not None:
         if args.write_name is None or args.write_value is None:
             raise ValueError("Both --write-name and --write-value are required in write mode")
-        if config.read_only_mode or not config.allow_writes:
-            raise ValueError(
-                "Writes are disabled by config. Set read_only_mode=false and allow_writes=true"
-            )
+        if not config.allow_writes:
+            raise ValueError("Writes are disabled by config. Set allow_writes=true")
 
         definition = next(
             (item for item in config.write_parameters if item.name == args.write_name),
