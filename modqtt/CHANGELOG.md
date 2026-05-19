@@ -12,6 +12,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 - Removed `modqtt/README.md` and consolidated add-on documentation reference to `modqtt/DOCS.md`.
 - Updated repository URLs and Home Assistant repository badge links to `YpsilonTM/hassaddons` after repo rename.
 - Updated add-on image path to `ghcr.io/ypsilontm/hassaddons/addon-modqtt` to match the renamed repository workflow output.
+- Updated repository display name in `repository.yaml` to a generic multi-add-on title.
 
 ## [0.2.1] - 2026-05-20
 ### Fixed
