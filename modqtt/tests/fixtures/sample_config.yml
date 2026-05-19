@@ -1,5 +1,4 @@
 profile: dev
-read_only_mode: true
 allow_writes: false
 modbus:
   host: 192.168.1.10
