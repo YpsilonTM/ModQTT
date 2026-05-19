@@ -6,8 +6,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 ### Added
-- Added `README.md` intro for Home Assistant add-on presentation.
-- Added one-click "Add add-on repository" Home Assistant badge to `README.md`.
+- Added root-level repository `README.md` to support multi-add-on presentation.
+
+### Changed
+- Removed `modqtt/README.md` and consolidated add-on documentation reference to `modqtt/DOCS.md`.
 
 ## [0.2.1] - 2026-05-20
 ### Fixed
