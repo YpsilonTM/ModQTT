@@ -1,0 +1,485 @@
+from __future__ import annotations
+
+import argparse
+import asyncio
+import json
+import logging
+import math
+import uuid
+from datetime import datetime, timezone
+from typing import Any
+
+import paho.mqtt.client as mqtt
+try:
+    from websockets.asyncio.server import serve as ws_serve
+    _WEBSOCKETS_NEW_API = True
+except ImportError:
+    from websockets.legacy.server import serve as ws_serve  # type: ignore[no-redef]
+    _WEBSOCKETS_NEW_API = False
+
+from config import Config
+
+CALL = 2
+CALL_RESULT = 3
+CALL_ERROR = 4
+
+log = logging.getLogger("ocppsigen2mqtt")
+
+
+class ChargePoint:
+    """Tracks per-charge-point state and active transaction."""
+
+    def __init__(self, cp_id: str) -> None:
+        self.cp_id = cp_id
+        self.websocket: Any = None
+        self.transaction_id: int | None = None
+        self.connected_at = datetime.now(timezone.utc).isoformat()
+
+
+class OcppBridge:
+    def __init__(self, config: Config) -> None:
+        self.config = config
+        self.loop: asyncio.AbstractEventLoop | None = None
+        self.charge_points: dict[str, ChargePoint] = {}
+        self.pending: dict[str, asyncio.Future[Any]] = {}
+        self.authorize_enabled = config.authorize_enabled
+        self.last_active_phases: int | None = None
+        self.usable_phases = max(1, min(3, int(config.usable_phases)))
+        self.nominal_voltage_v = 230.0
+
+        try:
+            self.mq = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2, client_id=config.mqtt.client_id)  # paho-mqtt >= 2.0
+        except AttributeError:
+            self.mq = mqtt.Client(client_id=config.mqtt.client_id)  # paho-mqtt < 2.0
+        if config.mqtt.username:
+            self.mq.username_pw_set(config.mqtt.username, config.mqtt.password)
+        self.mq.on_connect = self._on_mqtt_connect
+        self.mq.on_message = self._on_mqtt_message
+
+    # ------------------------------------------------------------------ MQTT
+
+    def _prefix(self, *parts: str) -> str:
+        return "/".join([self.config.mqtt.topic_prefix, *parts])
+
+    def _on_mqtt_connect(self, client: mqtt.Client, _ud: Any, _flags: Any, rc: Any, *_args: Any) -> None:
+        # rc is int (v1 API) or ReasonCode (v2 API); treat non-zero / non-Success as failure
+        success = (rc == 0) if isinstance(rc, int) else rc.is_failure is False
+        if not success:
+            log.error("MQTT connect failed, rc=%s", rc)
+            return
+        log.info("MQTT connected to %s:%s", self.config.mqtt.host, self.config.mqtt.port)
+        prefix = self.config.mqtt.topic_prefix
+        client.subscribe(f"{prefix}/command/start")
+        client.subscribe(f"{prefix}/command/stop")
+        client.subscribe(f"{prefix}/command/reset")
+        client.subscribe(f"{prefix}/command/get_config")
+        client.subscribe(f"{prefix}/command/set_config")
+        client.subscribe(f"{prefix}/command/set_power_watts")
+        client.subscribe(f"{prefix}/command/toggle_authorize")
+        # Backwards compatible path-based command topics.
+        client.subscribe(f"{prefix}/+/command/start")
+        client.subscribe(f"{prefix}/+/command/stop")
+        client.subscribe(f"{prefix}/+/command/reset")
+        client.subscribe(f"{prefix}/+/command/get_config")
+        client.subscribe(f"{prefix}/+/command/set_config")
+        log.info("Subscribed to command topics under %s/command/", prefix)
+
+    def _on_mqtt_message(self, _client: mqtt.Client, _ud: Any, msg: mqtt.MQTTMessage) -> None:
+        if not self.loop:
+            return
+        topic = msg.topic
+        raw = msg.payload.decode("utf-8") if msg.payload else "{}"
+        try:
+            payload = json.loads(raw) if raw.strip() else {}
+        except json.JSONDecodeError:
+            log.error("Bad JSON on %s: %s", topic, raw)
+            return
+
+        prefix = self.config.mqtt.topic_prefix
+        if not topic.startswith(f"{prefix}/"):
+            return
+        suffix = topic[len(prefix) + 1 :]
+        parts = suffix.split("/")
+        if len(parts) < 2:
+            return
+
+        cp_id = self.config.charger_id
+        command = parts[-1]
+        # Support both:
+        # - {prefix}/command/start
+        # - {prefix}/{cp_id}/command/start
+        if parts[0] != "command" and len(parts) >= 3 and parts[1] == "command":
+            cp_id = parts[0]
+
+        dispatch = {
+            "start": self._cmd_start,
+            "stop": self._cmd_stop,
+            "reset": self._cmd_reset,
+            "get_config": self._cmd_get_config,
+            "set_config": self._cmd_set_config,
+            "set_power_watts": self._cmd_set_power_watts,
+            "toggle_authorize": self._cmd_toggle_authorize,
+        }
+        handler = dispatch.get(command)
+        if handler:
+            asyncio.run_coroutine_threadsafe(handler(cp_id, payload), self.loop)
+
+    def publish(self, topic: str, payload: Any, retain: bool = True) -> None:
+        body = json.dumps(payload) if not isinstance(payload, str) else payload
+        self.mq.publish(topic, body, retain=retain)
+
+    def publish_event(self, topic_suffix: str, payload: Any, retain: bool = True) -> None:
+        topic = self._prefix(topic_suffix)
+        if isinstance(payload, dict):
+            enriched = {"charger_id": self.config.charger_id, **payload}
+            self.publish(topic, enriched, retain=retain)
+            return
+        self.publish(topic, {"charger_id": self.config.charger_id, "value": payload}, retain=retain)
+
+    # ---------------------------------------------------------- MQTT commands
+
+    async def _cmd_start(self, cp_id: str, data: dict) -> None:
+        request = {
+            "connectorId": int(data.get("connector_id", 1)),
+            "idTag": data.get("id_tag", "REMOTE"),
+        }
+        await self._call_and_publish(cp_id, "RemoteStartTransaction", request, "command_result/start")
+
+    async def _cmd_stop(self, cp_id: str, data: dict) -> None:
+        cp = self.charge_points.get(cp_id)
+        txn_id = data.get("transaction_id") or (cp.transaction_id if cp else None)
+        if txn_id is None:
+            log.error("Stop command for %s missing transaction_id and no active transaction known", cp_id)
+            self.publish_event("command_result/stop", {"status": "error", "message": "no transaction_id"}, retain=False)
+            return
+        await self._call_and_publish(cp_id, "RemoteStopTransaction", {"transactionId": int(txn_id)}, "command_result/stop")
+
+    async def _cmd_reset(self, cp_id: str, data: dict) -> None:
+        reset_type = data.get("type", "Soft")
+        await self._call_and_publish(cp_id, "Reset", {"type": reset_type}, "command_result/reset")
+
+    async def _cmd_get_config(self, cp_id: str, data: dict) -> None:
+        keys = data.get("keys", [])
+        payload: dict[str, Any] = {"key": keys} if keys else {}
+        await self._call_and_publish(cp_id, "GetConfiguration", payload, "command_result/get_config")
+
+    async def _cmd_set_config(self, cp_id: str, data: dict) -> None:
+        key = data.get("key")
+        value = data.get("value")
+        if not key or value is None:
+            self.publish_event("command_result/set_config", {"status": "error", "message": "key and value required"}, retain=False)
+            return
+        await self._call_and_publish(cp_id, "ChangeConfiguration", {"key": key, "value": str(value)}, "command_result/set_config")
+
+    async def _cmd_set_power_watts(self, cp_id: str, data: dict) -> None:
+        watts_raw = data.get("watts")
+        if watts_raw is None:
+            self.publish_event(
+                "command_result/set_power_watts",
+                {"status": "error", "message": "watts required"},
+                retain=False,
+            )
+            return
+
+        try:
+            watts = float(watts_raw)
+        except (TypeError, ValueError):
+            self.publish_event(
+                "command_result/set_power_watts",
+                {"status": "error", "message": "watts must be numeric"},
+                retain=False,
+            )
+            return
+
+        if watts <= 0:
+            self.publish_event(
+                "command_result/set_power_watts",
+                {"status": "error", "message": "watts must be > 0"},
+                retain=False,
+            )
+            return
+
+        phases = int(data.get("phases") or self.usable_phases)
+        phases = max(1, min(3, phases))
+        current_per_phase = math.floor(watts / (self.nominal_voltage_v * phases))
+        clamped_current = max(6, min(16, current_per_phase))
+
+        key = data.get("key", "MaxCurrentOnVehicleConnector")
+        request = {"key": str(key), "value": str(clamped_current)}
+        try:
+            result = await self._send_call(cp_id, "ChangeConfiguration", request)
+            self.publish_event(
+                "command_result/set_power_watts",
+                {
+                    "status": "ok",
+                    "result": result,
+                    "requested_watts": watts,
+                    "configured_current_a": clamped_current,
+                    "assumed_voltage_v": self.nominal_voltage_v,
+                    "assumed_phases": phases,
+                    "estimated_watts": clamped_current * self.nominal_voltage_v * phases,
+                    "config_key": key,
+                },
+                retain=False,
+            )
+        except Exception as exc:
+            log.exception("set_power_watts failed for %s: %s", cp_id, exc)
+            self.publish_event(
+                "command_result/set_power_watts",
+                {"status": "error", "message": str(exc)},
+                retain=False,
+            )
+
+    async def _cmd_toggle_authorize(self, _cp_id: str, data: dict) -> None:
+        """Toggle authorization gate. Does not require charger connection."""
+        enabled = data.get("enabled")
+        if enabled is None:
+            # Toggle behavior
+            self.authorize_enabled = not self.authorize_enabled
+        else:
+            # Set to explicit value
+            self.authorize_enabled = bool(enabled)
+        log.info("Authorization gate is now %s", "enabled" if self.authorize_enabled else "disabled")
+        self.publish_event("authorize/state", {"enabled": self.authorize_enabled}, retain=False)
+
+    async def _call_and_publish(self, cp_id: str, action: str, payload: dict, result_topic: str) -> None:
+        try:
+            result = await self._send_call(cp_id, action, payload)
+            self.publish_event(result_topic, {"status": "ok", "result": result}, retain=False)
+        except Exception as exc:
+            log.exception("%s failed for %s: %s", action, cp_id, exc)
+            self.publish_event(result_topic, {"status": "error", "message": str(exc)}, retain=False)
+
+    # --------------------------------------------------------- OCPP outbound
+
+    async def _send_call(self, cp_id: str, action: str, payload: dict, timeout: int = 20) -> Any:
+        cp = self.charge_points.get(cp_id)
+        if not cp or not cp.websocket:
+            raise RuntimeError(f"Charge point {cp_id!r} is not connected")
+        msg_id = uuid.uuid4().hex[:12]
+        future: asyncio.Future[Any] = self.loop.create_future()  # type: ignore[union-attr]
+        self.pending[msg_id] = future
+        frame = json.dumps([CALL, msg_id, action, payload])
+        log.info("-> %s %s %s", cp_id, action, payload)
+        await cp.websocket.send(frame)
+        try:
+            return await asyncio.wait_for(future, timeout=timeout)
+        finally:
+            self.pending.pop(msg_id, None)
+
+    # --------------------------------------------------------- OCPP inbound
+
+    async def handle_connection(self, websocket: Any, path: str = "") -> None:
+        if not path:
+            # websockets >= 14 asyncio API: path is on the request object
+            path = getattr(getattr(websocket, "request", None), "path", "") or ""
+        requested_cp_id = path.strip("/").split("/")[-1] if path.strip("/") else ""
+        cp_id = self.config.charger_id or requested_cp_id or "unknown"
+        if requested_cp_id and cp_id != requested_cp_id:
+            log.warning(
+                "Connection cp_id '%s' overridden by configured charger_id '%s'",
+                requested_cp_id,
+                cp_id,
+            )
+        cp = ChargePoint(cp_id)
+        cp.websocket = websocket
+        self.charge_points[cp_id] = cp
+        log.info("Charge point connected: %s", cp_id)
+        self.publish_event("availability", "online")
+        self.publish_event("bridge/availability", "online")
+
+        try:
+            async for raw in websocket:
+                log.debug("<- %s %s", cp_id, raw)
+                await self._handle_frame(cp, raw)
+        except Exception as exc:
+            log.info("Connection closed for %s: %s", cp_id, exc)
+        finally:
+            self.charge_points.pop(cp_id, None)
+            self.publish_event("availability", "offline")
+            log.info("Charge point disconnected: %s", cp_id)
+
+    async def _handle_frame(self, cp: ChargePoint, raw: str) -> None:
+        try:
+            frame = json.loads(raw)
+        except json.JSONDecodeError:
+            log.error("Invalid JSON from %s", cp.cp_id)
+            return
+
+        if not isinstance(frame, list) or len(frame) < 3:
+            log.error("Malformed OCPP frame from %s: %s", cp.cp_id, frame)
+            return
+
+        msg_type = frame[0]
+        msg_id = frame[1]
+
+        if msg_type == CALL:
+            action = frame[2]
+            payload = frame[3] if len(frame) > 3 else {}
+            await self._handle_call(cp, msg_id, action, payload)
+
+        elif msg_type == CALL_RESULT:
+            result = frame[2] if len(frame) > 2 else {}
+            future = self.pending.get(msg_id)
+            if future and not future.done():
+                future.set_result(result)
+
+        elif msg_type == CALL_ERROR:
+            error_code = frame[2] if len(frame) > 2 else "UnknownError"
+            error_msg = frame[3] if len(frame) > 3 else ""
+            future = self.pending.get(msg_id)
+            if future and not future.done():
+                future.set_exception(RuntimeError(f"{error_code}: {error_msg}"))
+
+    async def _handle_call(self, cp: ChargePoint, msg_id: str, action: str, payload: dict) -> None:
+        log.info("<- %s %s %s", cp.cp_id, action, payload)
+        response: dict[str, Any] = {}
+
+        if action == "BootNotification":
+            response = {
+                "status": "Accepted",
+                "currentTime": datetime.now(timezone.utc).isoformat(),
+                "interval": 30,
+            }
+            self.publish_event("boot", payload)
+
+        elif action == "Heartbeat":
+            response = {"currentTime": datetime.now(timezone.utc).isoformat()}
+
+        elif action == "Authorize":
+            if self.authorize_enabled:
+                response = {"idTagInfo": {"status": "Accepted"}}
+            else:
+                log.info("Authorization blocked for %s (authorize_enabled=false)", cp.cp_id)
+                response = {"idTagInfo": {"status": "Blocked"}}
+
+        elif action == "StatusNotification":
+            status = payload.get("status", "Unknown")
+            connector = payload.get("connectorId", 0)
+            self.publish_event(f"connector/{connector}/status", status)
+            self.publish_event("status", payload)
+
+        elif action == "StartTransaction":
+            cp.transaction_id = int(datetime.now(timezone.utc).timestamp())
+            response = {
+                "transactionId": cp.transaction_id,
+                "idTagInfo": {"status": "Accepted"},
+            }
+            self.publish_event("transaction/active", {
+                "transaction_id": cp.transaction_id,
+                "id_tag": payload.get("idTag"),
+                "connector_id": payload.get("connectorId"),
+                "meter_start": payload.get("meterStart"),
+                "timestamp": payload.get("timestamp"),
+            })
+
+        elif action == "StopTransaction":
+            self.publish_event("transaction/last", {
+                "transaction_id": payload.get("transactionId"),
+                "meter_stop": payload.get("meterStop"),
+                "timestamp": payload.get("timestamp"),
+                "reason": payload.get("reason"),
+            })
+            cp.transaction_id = None
+            response = {"idTagInfo": {"status": "Accepted"}}
+
+        elif action == "MeterValues":
+            self._publish_meter_values(cp, payload)
+
+        elif action == "DataTransfer":
+            response = {"status": "Accepted"}
+
+        await cp.websocket.send(json.dumps([CALL_RESULT, msg_id, response]))
+
+    def _publish_meter_values(self, cp: ChargePoint, payload: dict) -> None:
+        metrics: dict[str, Any] = {
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "transaction_id": payload.get("transactionId"),
+        }
+        phase_currents: dict[str, float] = {}
+
+        for meter in payload.get("meterValue", []):
+            for sv in meter.get("sampledValue", []):
+                measurand = sv.get("measurand", "Energy.Active.Import.Register")
+                unit = sv.get("unit", "")
+                raw_value = sv.get("value")
+                if raw_value is None:
+                    continue
+                try:
+                    value = float(raw_value)
+                except ValueError:
+                    continue
+
+                if measurand == "Power.Active.Import":
+                    w = value * 1000 if unit == "kW" else value
+                    metrics["power_w"] = w
+                    self.publish_event("power_w", {"value": w})
+
+                elif measurand == "Current.Import":
+                    metrics["current_a"] = value
+                    self.publish_event("current_a", {"value": value})
+                    phase = sv.get("phase")
+                    if phase in {"L1", "L2", "L3"}:
+                        phase_currents[phase] = value
+
+                elif measurand == "Current.Offered":
+                    metrics["current_offered_a"] = value
+
+                elif measurand == "Energy.Active.Import.Register":
+                    wh = value * 1000 if unit == "kWh" else value
+                    metrics["total_energy_wh"] = wh
+                    self.publish_event("total_energy_wh", {"value": wh})
+
+                elif measurand == "Voltage":
+                    metrics["voltage_v"] = value
+                    self.publish_event("voltage_v", {"value": value})
+
+        active_phases = sum(1 for val in phase_currents.values() if val > 0.1)
+        if active_phases > 0:
+            self.last_active_phases = active_phases
+            metrics["active_phases"] = active_phases
+
+        self.publish_event("metrics", metrics)
+
+    # --------------------------------------------------------------- startup
+
+    async def run(self) -> None:
+        self.loop = asyncio.get_running_loop()
+        self.mq.connect(self.config.mqtt.host, self.config.mqtt.port)
+        self.mq.loop_start()
+
+        log.info(
+            "Starting OCPP server on %s:%s  (topic prefix: %s)",
+            self.config.ocpp.host, self.config.ocpp.port, self.config.mqtt.topic_prefix,
+        )
+        self.publish_event("bridge/availability", "online")
+        async with ws_serve(
+            self.handle_connection,
+            self.config.ocpp.host,
+            self.config.ocpp.port,
+            subprotocols=["ocpp1.6"],
+        ):
+            await asyncio.Future()
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description="OCPP SIGEN to MQTT bridge")
+    parser.add_argument("--config", default="", help="Path to runtime YAML config")
+    args = parser.parse_args()
+
+    config = Config.load(args.config or None)
+
+    logging.basicConfig(
+        level=config.log_level,
+        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+        handlers=[logging.StreamHandler()],
+    )
+
+    try:
+        asyncio.run(OcppBridge(config).run())
+    except KeyboardInterrupt:
+        log.info("Shutdown")
+
+
+if __name__ == "__main__":
+    main()

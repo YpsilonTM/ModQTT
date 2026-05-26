@@ -1,0 +1,310 @@
+"""Tests for OCPP bridge logic."""
+from __future__ import annotations
+
+import asyncio
+import json
+from unittest.mock import MagicMock
+
+import pytest
+
+import sys, os
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
+
+from config import Config
+from server import CALL, CALL_RESULT, CALL_ERROR, ChargePoint, OcppBridge
+
+
+def make_bridge() -> OcppBridge:
+    cfg = Config()
+    bridge = OcppBridge(cfg)
+    bridge.loop = asyncio.get_event_loop()
+    bridge.mq = MagicMock()
+    return bridge
+
+
+@pytest.mark.asyncio
+async def test_boot_notification_returns_accepted():
+    bridge = make_bridge()
+    ws = MagicMock()
+    ws.__aiter__ = MagicMock(return_value=iter([]))
+    sent_frames = []
+    async def fake_send(data):
+        sent_frames.append(json.loads(data))
+    ws.send = fake_send
+
+    cp = ChargePoint("TEST01")
+    cp.websocket = ws
+
+    boot_frame = json.dumps([CALL, "msg1", "BootNotification", {
+        "chargePointModel": "EVAC11",
+        "chargePointVendor": "SIGEN",
+    }])
+    await bridge._handle_frame(cp, boot_frame)
+
+    assert len(sent_frames) == 1
+    resp = sent_frames[0]
+    assert resp[0] == CALL_RESULT
+    assert resp[1] == "msg1"
+    assert resp[2]["status"] == "Accepted"
+
+
+@pytest.mark.asyncio
+async def test_meter_values_published():
+    bridge = make_bridge()
+    ws = MagicMock()
+    async def fake_send(data):
+        pass
+    ws.send = fake_send
+
+    cp = ChargePoint("TEST01")
+    cp.websocket = ws
+    bridge.charge_points["TEST01"] = cp
+
+    published: dict[str, object] = {}
+    def fake_publish(topic, payload, retain=True):
+        published[topic] = payload
+    bridge.publish = fake_publish
+
+    payload = {
+        "connectorId": 1,
+        "transactionId": 42,
+        "meterValue": [{
+            "timestamp": "2025-01-01T00:00:00Z",
+            "sampledValue": [
+                {"measurand": "Power.Active.Import", "value": "3.5", "unit": "kW"},
+                {"measurand": "Current.Import", "value": "15.2", "unit": "A"},
+                {"measurand": "Energy.Active.Import.Register", "value": "12.345", "unit": "kWh"},
+            ],
+        }],
+    }
+    meter_frame = json.dumps([CALL, "msg2", "MeterValues", payload])
+    await bridge._handle_frame(cp, meter_frame)
+
+    assert published["ocpp/power_w"] == {"charger_id": "CHARGER01", "value": 3500.0}
+    assert published["ocpp/current_a"] == {"charger_id": "CHARGER01", "value": 15.2}
+    assert published["ocpp/total_energy_wh"] == {"charger_id": "CHARGER01", "value": 12345.0}
+
+
+@pytest.mark.asyncio
+async def test_start_transaction_assigns_transaction_id():
+    bridge = make_bridge()
+    ws = MagicMock()
+    async def fake_send(data):
+        pass
+    ws.send = fake_send
+
+    cp = ChargePoint("TEST01")
+    cp.websocket = ws
+    bridge.charge_points["TEST01"] = cp
+
+    published = {}
+    def fake_publish(topic, payload, retain=True):
+        published[topic] = payload
+    bridge.publish = fake_publish
+
+    payload = {
+        "connectorId": 1,
+        "idTag": "REMOTE",
+        "meterStart": 0,
+        "timestamp": "2025-01-01T00:00:00Z",
+    }
+    frame = json.dumps([CALL, "msg3", "StartTransaction", payload])
+    await bridge._handle_frame(cp, frame)
+
+    assert cp.transaction_id is not None
+    assert "ocpp/transaction/active" in published
+    assert published["ocpp/transaction/active"]["charger_id"] == "CHARGER01"
+
+
+@pytest.mark.asyncio
+async def test_stop_transaction_clears_transaction_id():
+    bridge = make_bridge()
+    ws = MagicMock()
+    async def fake_send(data):
+        pass
+    ws.send = fake_send
+
+    cp = ChargePoint("TEST01")
+    cp.websocket = ws
+    cp.transaction_id = 999
+    bridge.charge_points["TEST01"] = cp
+
+    published = {}
+    def fake_publish(topic, payload, retain=True):
+        published[topic] = payload
+    bridge.publish = fake_publish
+
+    payload = {
+        "transactionId": 999,
+        "meterStop": 5000,
+        "timestamp": "2025-01-01T01:00:00Z",
+        "reason": "Remote",
+    }
+    frame = json.dumps([CALL, "msg4", "StopTransaction", payload])
+    await bridge._handle_frame(cp, frame)
+
+    assert cp.transaction_id is None
+    assert "ocpp/transaction/last" in published
+    assert published["ocpp/transaction/last"]["charger_id"] == "CHARGER01"
+
+
+@pytest.mark.asyncio
+async def test_authorize_accepted_when_enabled():
+    """Charger should receive Accepted when authorize is enabled."""
+    bridge = make_bridge()
+    assert bridge.authorize_enabled is True
+
+    ws = MagicMock()
+    sent_frames = []
+    async def fake_send(data):
+        sent_frames.append(json.loads(data))
+    ws.send = fake_send
+
+    cp = ChargePoint("TEST01")
+    cp.websocket = ws
+
+    auth_frame = json.dumps([CALL, "auth1", "Authorize", {"idTag": "REMOTE"}])
+    await bridge._handle_frame(cp, auth_frame)
+
+    assert len(sent_frames) == 1
+    resp = sent_frames[0]
+    assert resp[0] == CALL_RESULT
+    assert resp[1] == "auth1"
+    assert resp[2]["idTagInfo"]["status"] == "Accepted"
+
+
+@pytest.mark.asyncio
+async def test_authorize_blocked_when_disabled():
+    """Charger should receive Blocked when authorize is disabled."""
+    cfg = Config()
+    cfg.authorize_enabled = False
+    bridge = OcppBridge(cfg)
+    bridge.loop = asyncio.get_event_loop()
+    bridge.mq = MagicMock()
+
+    ws = MagicMock()
+    sent_frames = []
+    async def fake_send(data):
+        sent_frames.append(json.loads(data))
+    ws.send = fake_send
+
+    cp = ChargePoint("TEST01")
+    cp.websocket = ws
+
+    auth_frame = json.dumps([CALL, "auth1", "Authorize", {"idTag": "REMOTE"}])
+    await bridge._handle_frame(cp, auth_frame)
+
+    assert len(sent_frames) == 1
+    resp = sent_frames[0]
+    assert resp[0] == CALL_RESULT
+    assert resp[1] == "auth1"
+    assert resp[2]["idTagInfo"]["status"] == "Blocked"
+
+
+@pytest.mark.asyncio
+async def test_toggle_authorize_toggles_state():
+    """Calling toggle_authorize without enabled field should toggle."""
+    bridge = make_bridge()
+    initial_state = bridge.authorize_enabled
+
+    published = {}
+    def fake_publish(topic, payload, retain=True):
+        published[topic] = payload
+    bridge.publish = fake_publish
+
+    await bridge._cmd_toggle_authorize("TEST01", {})
+
+    assert bridge.authorize_enabled == (not initial_state)
+    assert "ocpp/authorize/state" in published
+    assert published["ocpp/authorize/state"]["enabled"] == (not initial_state)
+
+
+@pytest.mark.asyncio
+async def test_toggle_authorize_sets_explicit_state():
+    """Calling toggle_authorize with enabled field should set that value."""
+    bridge = make_bridge()
+
+    published = {}
+    def fake_publish(topic, payload, retain=True):
+        published[topic] = payload
+    bridge.publish = fake_publish
+
+    await bridge._cmd_toggle_authorize("TEST01", {"enabled": False})
+
+    assert bridge.authorize_enabled is False
+    assert "ocpp/authorize/state" in published
+    assert published["ocpp/authorize/state"]["enabled"] is False
+
+    await bridge._cmd_toggle_authorize("TEST01", {"enabled": True})
+
+    assert bridge.authorize_enabled is True
+    assert published["ocpp/authorize/state"]["enabled"] is True
+
+
+@pytest.mark.asyncio
+async def test_set_power_watts_uses_fixed_230v_and_active_phases():
+    bridge = make_bridge()
+
+    async def fake_send_call(cp_id, action, payload, timeout=20):
+        assert cp_id == "TEST01"
+        assert action == "ChangeConfiguration"
+        assert payload["key"] == "MaxCurrentOnVehicleConnector"
+        # floor(3000 / (230 * 2)) = 6
+        assert payload["value"] == "6"
+        return {"status": "Accepted"}
+
+    bridge._send_call = fake_send_call
+
+    published = {}
+
+    def fake_publish(topic, payload, retain=True):
+        published[topic] = payload
+
+    bridge.publish = fake_publish
+
+    await bridge._cmd_set_power_watts("TEST01", {"watts": 3000})
+
+    assert "ocpp/command_result/set_power_watts" in published
+    result = published["ocpp/command_result/set_power_watts"]
+    assert result["status"] == "ok"
+    assert result["configured_current_a"] == 6
+    assert result["assumed_voltage_v"] == 230.0
+    assert result["assumed_phases"] == 2
+
+
+@pytest.mark.asyncio
+async def test_set_power_watts_clamps_to_min_max():
+    bridge = make_bridge()
+
+    sent_values = []
+
+    async def fake_send_call(_cp_id, action, payload, timeout=20):
+        assert action == "ChangeConfiguration"
+        sent_values.append(int(payload["value"]))
+        return {"status": "Accepted"}
+
+    bridge._send_call = fake_send_call
+    bridge.publish = MagicMock()
+
+    # floor(500 / (230 * 2)) = 1 -> clamp to 6
+    await bridge._cmd_set_power_watts("TEST01", {"watts": 500})
+    # floor(10000 / (230 * 2)) = 21 -> clamp to 16
+    await bridge._cmd_set_power_watts("TEST01", {"watts": 10000})
+
+    assert sent_values == [6, 16]
+
+
+@pytest.mark.asyncio
+async def test_set_power_watts_command_can_override_phases():
+    bridge = make_bridge()
+    bridge.usable_phases = 2
+
+    async def fake_send_call(_cp_id, _action, payload, timeout=20):
+        # floor(3000 / (230 * 3)) = 4 -> clamp to 6
+        assert payload["value"] == "6"
+        return {"status": "Accepted"}
+
+    bridge._send_call = fake_send_call
+    bridge.publish = MagicMock()
+
+    await bridge._cmd_set_power_watts("TEST01", {"watts": 3000, "phases": 3})
