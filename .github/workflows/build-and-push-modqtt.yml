@@ -1,4 +1,4 @@
-name: Build and Push Add-on Image
+name: Build and Push ModQTT Add-on Image
 
 env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
@@ -19,11 +19,11 @@ on:
       - v*
     paths:
       - modqtt/**
-      - .github/workflows/build-and-push-addon.yml
+      - .github/workflows/build-and-push-modqtt.yml
   pull_request:
     paths:
       - modqtt/**
-      - .github/workflows/build-and-push-addon.yml
+      - .github/workflows/build-and-push-modqtt.yml
 
 permissions:
   contents: read
