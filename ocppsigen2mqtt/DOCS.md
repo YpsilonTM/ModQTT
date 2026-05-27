@@ -41,10 +41,16 @@ Home Assistant will auto-discover these entities:
   - Current (A)
   - Voltage (V)
   - Total Energy (Wh)
+  - Lifetime Energy (kWh)
 
 - **Binary Sensors:**
   - Charger Availability (online/offline)
   - Bridge Availability (online/offline)
+
+- **Buttons:**
+  - Start Charging
+  - Stop Charging
+  - Reset Charger
 
 All sensors are grouped under a device named `EV Charger {charger_id}` and appear in
 the **Integrations > MQTT > Discovered** list. They'll be created automatically without
@@ -67,6 +73,7 @@ All topics are prefixed with the configured `topic_prefix` (default `ocpp`).
 | `{prefix}/power_w` | float | Active power in Watts |
 | `{prefix}/current_a` | float | Import current in Amps |
 | `{prefix}/total_energy_wh` | float | Total energy in Wh |
+| `{prefix}/lifetime_energy_kwh` | float | Lifetime/cumulative charged energy in kWh |
 | `{prefix}/voltage_v` | float | Voltage in Volts |
 | `{prefix}/metrics` | JSON | All metrics combined |
 | `{prefix}/status` | JSON | Latest `StatusNotification` payload |

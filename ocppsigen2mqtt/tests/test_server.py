@@ -83,6 +83,7 @@ async def test_meter_values_published():
     assert published["ocpp/power_w"] == {"charger_id": "CHARGER01", "value": 3500.0}
     assert published["ocpp/current_a"] == {"charger_id": "CHARGER01", "value": 15.2}
     assert published["ocpp/total_energy_wh"] == {"charger_id": "CHARGER01", "value": 12345.0}
+    assert published["ocpp/lifetime_energy_kwh"] == {"charger_id": "CHARGER01", "value": 12.345}
 
 
 @pytest.mark.asyncio
@@ -345,3 +346,53 @@ async def test_set_power_watts_can_override_connector_for_idle_profile():
     bridge.publish = MagicMock()
 
     await bridge._cmd_set_power_watts("TEST01", {"watts": 3000, "connector_id": 2})
+
+
+def test_publish_ha_discovery_adds_buttons_and_voltage_icon():
+    bridge = make_bridge()
+
+    published: dict[str, object] = {}
+
+    def fake_publish(topic, payload, retain=True):
+        published[topic] = payload
+
+    bridge.publish = fake_publish
+
+    bridge._publish_ha_discovery()
+
+    voltage_topic = "homeassistant/sensor/charger01_voltage_v/config"
+    assert voltage_topic in published
+    voltage_payload = published[voltage_topic]
+    assert isinstance(voltage_payload, dict)
+    assert voltage_payload["icon"] == "mdi:sine-wave"
+
+    lifetime_energy_topic = "homeassistant/sensor/charger01_lifetime_energy_kwh/config"
+    assert lifetime_energy_topic in published
+    lifetime_energy_payload = published[lifetime_energy_topic]
+    assert isinstance(lifetime_energy_payload, dict)
+    assert lifetime_energy_payload["unit_of_measurement"] == "kWh"
+    assert lifetime_energy_payload["state_class"] == "total_increasing"
+
+    start_button_topic = "homeassistant/button/charger01_start_button/config"
+    stop_button_topic = "homeassistant/button/charger01_stop_button/config"
+    reset_button_topic = "homeassistant/button/charger01_reset_button/config"
+
+    assert start_button_topic in published
+    assert stop_button_topic in published
+    assert reset_button_topic in published
+
+    start_payload = published[start_button_topic]
+    stop_payload = published[stop_button_topic]
+    reset_payload = published[reset_button_topic]
+
+    assert isinstance(start_payload, dict)
+    assert isinstance(stop_payload, dict)
+    assert isinstance(reset_payload, dict)
+
+    assert start_payload["command_topic"] == "ocpp/command/start"
+    assert stop_payload["command_topic"] == "ocpp/command/stop"
+    assert reset_payload["command_topic"] == "ocpp/command/reset"
+
+    assert start_payload["payload_press"] == '{"connector_id": 1, "id_tag": "REMOTE"}'
+    assert stop_payload["payload_press"] == "{}"
+    assert reset_payload["payload_press"] == '{"type": "Soft"}'

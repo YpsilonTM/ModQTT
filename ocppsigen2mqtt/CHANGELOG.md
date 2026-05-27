@@ -6,6 +6,19 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-05-27
+
+### Fixed
+- Added Home Assistant MQTT discovery for command buttons (`start`, `stop`,
+  `reset`) so they appear directly on the charger device page.
+- Replaced the voltage sensor icon with `mdi:sine-wave` for consistent icon
+  rendering in Home Assistant.
+
+### Added
+- Added `lifetime_energy_kwh` sensor publication and Home Assistant discovery,
+  sourced from `Energy.Active.Import.Register` (with `meterStop` fallback on
+  `StopTransaction`).
+
 ## [0.2.2] - 2026-05-27
 
 ### Fixed

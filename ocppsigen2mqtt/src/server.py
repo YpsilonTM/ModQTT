@@ -172,7 +172,7 @@ class OcppBridge:
                 "name": "Voltage",
                 "device_class": "voltage",
                 "unit": "V",
-                "icon": "mdi:flash-circle",
+                "icon": "mdi:sine-wave",
                 "value_template": "{{ value_json.value }}",
             },
             {
@@ -181,6 +181,16 @@ class OcppBridge:
                 "device_class": "energy",
                 "unit": "Wh",
                 "icon": "mdi:lightning-bolt",
+                "state_class": "total_increasing",
+                "value_template": "{{ value_json.value }}",
+            },
+            {
+                "suffix": "lifetime_energy_kwh",
+                "name": "Lifetime Energy",
+                "device_class": "energy",
+                "unit": "kWh",
+                "icon": "mdi:counter",
+                "state_class": "total_increasing",
                 "value_template": "{{ value_json.value }}",
             },
         ]
@@ -204,9 +214,47 @@ class OcppBridge:
                 discovery_payload["unit_of_measurement"] = sensor["unit"]
             if sensor.get("icon"):
                 discovery_payload["icon"] = sensor["icon"]
+            if sensor.get("state_class"):
+                discovery_payload["state_class"] = sensor["state_class"]
 
             discovery_topic = f"homeassistant/sensor/{object_id}/config"
             self.publish(discovery_topic, discovery_payload, retain=True)
+            log.debug("Published Home Assistant discovery for %s", object_id)
+
+        # Command buttons
+        buttons = [
+            {
+                "suffix": "start",
+                "name": "Start Charging",
+                "icon": "mdi:play-circle",
+                "payload_press": json.dumps({"connector_id": 1, "id_tag": "REMOTE"}),
+            },
+            {
+                "suffix": "stop",
+                "name": "Stop Charging",
+                "icon": "mdi:stop-circle",
+                "payload_press": "{}",
+            },
+            {
+                "suffix": "reset",
+                "name": "Reset Charger",
+                "icon": "mdi:restart",
+                "payload_press": json.dumps({"type": "Soft"}),
+            },
+        ]
+
+        for button in buttons:
+            object_id = f"{self.config.charger_id}_{button['suffix']}_button".lower()
+            button_payload = {
+                "name": f"{device['name']} {button['name']}",
+                "unique_id": f"ocpp_{object_id}",
+                "device": device,
+                "availability_topic": self._prefix("availability"),
+                "command_topic": self._prefix(f"command/{button['suffix']}"),
+                "payload_press": button["payload_press"],
+                "icon": button["icon"],
+            }
+            self.publish(f"homeassistant/button/{object_id}/config", button_payload, retain=True)
             log.debug("Published Home Assistant discovery for %s", object_id)
 
         # Binary sensor for availability
@@ -529,6 +577,13 @@ class OcppBridge:
                 "timestamp": payload.get("timestamp"),
                 "reason": payload.get("reason"),
             })
+            meter_stop = payload.get("meterStop")
+            try:
+                meter_stop_wh = float(meter_stop)
+                self.publish_event("total_energy_wh", {"value": meter_stop_wh})
+                self.publish_event("lifetime_energy_kwh", {"value": meter_stop_wh / 1000.0})
+            except (TypeError, ValueError):
+                pass
             cp.transaction_id = None
             response = {"idTagInfo": {"status": "Accepted"}}
 
@@ -585,6 +640,7 @@ class OcppBridge:
                     wh = value * 1000 if unit == "kWh" else value
                     metrics["total_energy_wh"] = wh
                     self.publish_event("total_energy_wh", {"value": wh})
+                    self.publish_event("lifetime_energy_kwh", {"value": wh / 1000.0})
 
                 elif measurand == "Voltage":
                     metrics["voltage_v"] = value
