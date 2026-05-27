@@ -6,6 +6,14 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [0.2.2] - 2026-05-27
+
+### Fixed
+- Simplified MQTT discovery payload for numeric sensors to match ModQTT
+  style: publish `availability_topic` only and omit optional availability
+  fields. This avoids schema edge cases and allows
+  power/current/voltage/energy sensors to be discovered reliably.
+
 ## [0.2.1] - 2026-05-27
 
 ### Fixed

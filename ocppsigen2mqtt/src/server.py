@@ -195,9 +195,6 @@ class OcppBridge:
                 "unique_id": f"ocpp_{object_id}",
                 "device": device,
                 "availability_topic": self._prefix("availability"),
-                "availability_mode": "topic",
-                "payload_available": "online",
-                "payload_not_available": "offline",
                 "value_template": sensor["value_template"],
             }
 
